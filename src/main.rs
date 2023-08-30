@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use fproxy::{
-    listener::{base::Listener, http2::Http2Listener, http3::Http3Listener},
-    server_config::ServerConfig,
+    config::ServerConfig,
+    listener::{http2::Http2Listener, http3::Http3Listener, Listener},
     util::get_log_level,
 };
 use std::path::PathBuf;
@@ -86,14 +86,16 @@ fn main() {
 
 async fn run<'a>(config: ServerConfig) -> Result<()> {
     let token = CancellationToken::new();
-    let cfg1 = config.clone();
+    let config = config.clone();
+    let token = token.clone();
     let http2_task = tokio::spawn(async move {
-        let http_listener = Http2Listener::new(cfg1);
+        let http_listener = Http2Listener::new(config, token);
     });
 
-    let ref2 = config.clone();
+    let config = config.clone();
+    let token = token.clone();
     let http3_task = tokio::spawn(async move {
-        let http_listener = Http3Listener::new(ref2);
+        let http_listener = Http3Listener::new(config, token);
     });
 
     let res = select! {
