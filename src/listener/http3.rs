@@ -1,5 +1,7 @@
 use crate::config::server_config::ServerConfig;
-use crate::listener::Listener;
+use crate::listener::listener::{
+    Cert, Listener, ALPN_QUIC_HTTP1, ALPN_QUIC_HTTP2, ALPN_QUIC_HTTP3,
+};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -16,69 +18,7 @@ pub struct Http3Listener {
     cancel_token: CancellationToken,
 }
 
-#[allow(unused)]
-pub const ALPN_QUIC_HTTP3: &[&[u8]] = &[b"h3"];
-#[allow(unused)]
-
 impl Http3Listener {
-    fn create_certs_chain(options: &ServerConfig) -> Result<(Vec<Certificate>, PrivateKey)> {
-        let (certs, key) =
-            if let (Some(key_path), Some(cert_path)) = (&options.key_file, &options.cert_file) {
-                let key = fs::read(key_path).context("failed to read private key")?;
-                let key = if key_path.extension().map_or(false, |x| x == "der") {
-                    rustls::PrivateKey(key)
-                } else {
-                    let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
-                        .context("malformed PKCS #8 private key")?;
-                    match pkcs8.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
-                        None => {
-                            let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
-                                .context("malformed PKCS #1 private key")?;
-                            match rsa.into_iter().next() {
-                                Some(x) => rustls::PrivateKey(x),
-                                None => {
-                                    return Err(anyhow!("no private keys found"));
-                                }
-                            }
-                        }
-                    }
-                };
-                let cert_chain = fs::read(cert_path).context("failed to read certificate chain")?;
-                let cert_chain = if cert_path.extension().map_or(false, |x| x == "der") {
-                    vec![rustls::Certificate(cert_chain)]
-                } else {
-                    rustls_pemfile::certs(&mut &*cert_chain)
-                        .context("invalid PEM-encoded certificate")?
-                        .into_iter()
-                        .map(rustls::Certificate)
-                        .collect()
-                };
-                debug!("loaded certificate");
-                (cert_chain, key)
-            } else {
-                let dirs = directories_next::ProjectDirs::from("org", "ferrum", "cert").unwrap();
-                let path = dirs.data_local_dir();
-                let cert_path = path.join("cert.der");
-                let key_path = path.join("key.der");
-
-                info!("generating self-signed certificate");
-                let cert = rcgen::generate_simple_self_signed(vec!["secure.ferrumgate.com".into()])
-                    .unwrap();
-
-                let key = cert.serialize_private_key_der();
-                let cert = cert.serialize_der().unwrap();
-                fs::create_dir_all(path).context("failed to create certificate directory")?;
-                fs::write(cert_path, &cert).context("failed to write certificate")?;
-                fs::write(key_path, &key).context("failed to write private key")?;
-
-                let key = rustls::PrivateKey(key);
-                let cert = rustls::Certificate(cert);
-                (vec![cert], key)
-            };
-        Ok((certs, key))
-    }
-
     async fn handle_connection(
         conn: quinn::Connecting,
     ) -> Result<(SendStream, RecvStream, Connection)> {
@@ -109,8 +49,12 @@ impl Listener for Http3Listener {
     }
 
     async fn listen(&mut self, port: u16) -> Result<()> {
-        let (certs, key) =
-            Http3Listener::create_certs_chain(&self.config).context("create chain failed")?;
+        let (certs, key) = Cert::create_certs_chain(
+            self.config.key_file,
+            self.config.cert_file,
+            "secure.ferrumgate.com",
+        )
+        .context("create chain failed")?;
 
         let mut server_crypto = rustls::ServerConfig::builder()
             .with_safe_defaults()
@@ -201,12 +145,6 @@ mod tests {
             log_level: "debug".to_string(),
             connect_timeout: 15000,
         }
-    }
-    #[tokio::test]
-    async fn test_create_certs_chain() {
-        let config = create_config();
-        let result = Http3Listener::create_certs_chain(&config);
-        assert_eq!(result.is_ok(), true);
     }
 
     #[tokio::test]
