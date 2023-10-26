@@ -1,9 +1,13 @@
 use crate::config::ServerConfig;
 use async_trait::async_trait;
+
+use std::borrow::BorrowMut;
 use std::fs;
 use std::net::SocketAddr;
+use std::rc::Rc;
+use std::str;
 use std::sync::Arc;
-use tokio::io::{copy, sink, split, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{copy, sink, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore, ServerName};
 use tokio_rustls::server::TlsStream;
@@ -11,9 +15,22 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Level};
 
-use crate::listener::Listener;
+use crate::listener::listener::Listener;
 use anyhow::{anyhow, Context, Result};
 use rustls::{Certificate, PrivateKey};
+
+use crate::service::tunnel::tunnel_proxy;
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use hyper::client::conn::http1::Builder;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::upgrade::Upgraded;
+use hyper::{Method, Request, Response};
+use hyper_util::rt::TokioIo;
+pub const ALPN_QUIC_HTTP2: &[&[u8]] = &[b"h2"];
+#[allow(unused)]
+pub const ALPN_QUIC_HTTP1: &[&[u8]] = &[b"http/1.1"];
 
 pub struct Http2Listener {
     config: ServerConfig,
@@ -76,6 +93,7 @@ impl Http2Listener {
                 let cert = rustls::Certificate(cert);
                 (vec![cert], key)
             };
+
         Ok(ServerCertChain { certs, key })
     }
 }
@@ -95,6 +113,8 @@ impl Listener for Http2Listener {
             .with_safe_defaults()
             .with_no_client_auth()
             .with_single_cert(certs.certs, certs.key)?;
+        config.alpn_protocols = ALPN_QUIC_HTTP1.iter().map(|&x| x.into()).collect();
+
         let acceptor = TlsAcceptor::from(Arc::new(config));
 
         let listener = TcpListener::bind(&self.config.listen).await?;
@@ -104,8 +124,12 @@ impl Listener for Http2Listener {
             let acceptor = acceptor.clone();
             let token = self.cancel_token.clone();
             let _task = tokio::spawn(async move {
-                let client = Http2Client::new(peer_addr, token, true);
-                client.accept(stream, acceptor)
+                let mut client = Http2Client::new(peer_addr, token, true);
+                let res = client.handle(acceptor, stream).await;
+                if res.is_err() {
+                    error!("client handle failed\n");
+                    return;
+                }
             });
         }
         Ok(())
@@ -124,7 +148,7 @@ struct Http2Client {
     reader: Option<ReadHalf<TlsStream<TcpStream>>>,
     writer: Option<WriteHalf<TlsStream<TcpStream>>>,
     cancel_token: CancellationToken,
-    stream: Option<TlsStream<TcpStream>>,
+    stream: Option<TokioIo<TlsStream<TcpStream>>>,
 }
 
 impl Http2Client {
@@ -138,19 +162,42 @@ impl Http2Client {
             stream: None,
         }
     }
-    async fn accept(&mut self, acceptor: TlsAcceptor, stream: TcpStream) -> Result<()> {
+    async fn handle(&mut self, acceptor: TlsAcceptor, stream: TcpStream) -> Result<()> {
         let mut accepted_stream = acceptor.accept(stream).await.map_err(|err| {
             error!("client accept failed {}", err);
             err
         })?;
 
-        let (mut reader, mut writer) = split(accepted_stream);
-        self.reader = Some(reader);
-        self.writer = Some(writer);
-        self.stream = Some(accepted_stream);
+        //let (mut reader, mut writer) = split(accepted_stream);
+        //self.reader = Some(reader);
+        //self.writer = Some(writer);
+        //self.stream = Some(TokioIo::new(accepted_stream));
+
+        let io = TokioIo::new(accepted_stream);
+        if let Err(err) = http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(io, service_fn(tunnel_proxy))
+            .with_upgrades()
+            .await
+        {
+            println!("Failed to serve connection: {:?}", err);
+        }
         Ok(())
     }
-    async fn handle(&mut self) {
-        loop {}
+
+    async fn handle2(&mut self) {
+        let mut buf = vec![0u8; 2048];
+        let result = self.reader.as_mut().unwrap().read(buf.as_mut()).await;
+        if result.is_err() {
+            error!("read failed {}", result.unwrap_err());
+            return;
+        }
+        let length = result.unwrap();
+        let data = &buf[0..length];
+        debug!("readed data len: {}", length);
+        let input = String::from_utf8_lossy(data);
+
+        info!("output is {}", input);
     }
 }
